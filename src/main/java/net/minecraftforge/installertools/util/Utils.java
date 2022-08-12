@@ -25,6 +25,7 @@ import java.io.OutputStream;
 import java.util.Enumeration;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
+import java.util.zip.ZipInputStream;
 
 public class Utils {
     public static byte[] toByteArray(InputStream input) throws IOException {

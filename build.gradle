@@ -53,6 +53,8 @@ dependencies {
     implementation 'de.siegmar:fastcsv:2.0.0'
     implementation 'net.minecraftforge:srgutils:0.4.11'
     implementation 'org.ow2.asm:asm-commons:9.3'
+    implementation 'net.minecraftforge:JarJarMetadata:0.3.16'
+    implementation 'net.minecraftforge:JarJarSelector:0.3.16'
 }
 
 publishing {

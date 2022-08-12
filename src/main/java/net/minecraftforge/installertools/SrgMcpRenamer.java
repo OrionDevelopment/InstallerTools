@@ -31,6 +31,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Optional;
+import java.util.Set;
 import java.util.function.Predicate;
 import java.util.jar.Attributes;
 import java.util.jar.Manifest;
@@ -41,6 +43,10 @@ import java.util.zip.ZipFile;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
 
+import net.minecraftforge.jarjar.metadata.ContainedJarMetadata;
+import net.minecraftforge.jarjar.metadata.Metadata;
+import net.minecraftforge.jarjar.metadata.MetadataIOHandler;
+import net.minecraftforge.jarjar.selection.util.Constants;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.commons.ClassRemapper;
@@ -61,6 +67,7 @@ public class SrgMcpRenamer extends Task {
         OptionSpec<File> inputO = parser.accepts("input").withRequiredArg().ofType(File.class).required();
         OptionSpec<File> outputO = parser.accepts("output").withRequiredArg().ofType(File.class).required();
         parser.accepts("strip-signatures");
+        parser.accepts("remap-embedded");
 
         try {
             OptionSet options = parser.parse(args);
@@ -69,6 +76,7 @@ public class SrgMcpRenamer extends Task {
             File input = options.valueOf(inputO).getAbsoluteFile();
             File output = options.valueOf(outputO).getAbsoluteFile();
             boolean stripSignatures = options.has("strip-signatures");
+            boolean remapEmbedded = options.has("remap-embedded");
 
             log("Input:  " + input);
             log("Output: " + output);
@@ -100,53 +108,99 @@ public class SrgMcpRenamer extends Task {
                 }
             }
 
-            Remapper remapper = new Remapper() {
-                @Override
-                public String mapFieldName(final String owner, final String name, final String descriptor) {
-                    return map.getOrDefault(name, name);
-                }
-                @Override
-                public String mapInvokeDynamicMethodName(final String name, final String descriptor) {
-                    return map.getOrDefault(name, name);
-                }
-                @Override
-                public String mapMethodName(final String owner, final String name, final String descriptor) {
-                  return map.getOrDefault(name, name);
-                }
-            };
-
-            log("Processing ZIP file");
-            List<ZipEntryProcessor> processors = new ArrayList<>();
-            processors.add(new ZipEntryProcessor(ein -> ein.getName().endsWith(".class"), (ein, zin, zout) -> this.processClass(ein, zin, zout, remapper)));
-
-            if (stripSignatures) {
-                processors.add(new ZipEntryProcessor(this::holdsSignatures, (ein, zin, zout) -> log("Stripped signature entry data " + ein.getName())));
-                processors.add(new ZipEntryProcessor(ein -> ein.getName().endsWith("META-INF/MANIFEST.MF"), this::processManifest));
-            }
-
-            ZipWritingConsumer defaultProcessor = (ein, zin, zout) -> {
-                zout.putNextEntry(makeNewEntry(ein));
-                Utils.copy(zin, zout);
-            };
-
-            ByteArrayOutputStream memory = input.equals(output) ? new ByteArrayOutputStream() : null;
-            try (ZipOutputStream zout = new ZipOutputStream(memory == null ? new FileOutputStream(output) : memory);
-                ZipInputStream in = new ZipInputStream(new FileInputStream(input))) {
-
-                forEachZipEntry(in, (ein, zin) -> processors.stream()
-                        .filter(it -> it.validate(ein))
-                        .findFirst()
-                        .map(ZipEntryProcessor::getProcessor)
-                        .orElse(defaultProcessor)
-                        .process(ein, zin, zout));
-            }
-
-            if (memory != null)
-                Files.write(output.toPath(), memory.toByteArray());
+            processJar(input, output, stripSignatures, remapEmbedded, map);
 
             log("Process complete");
         } catch (OptionException e) {
             parser.printHelpOn(System.out);
+            e.printStackTrace();
+        }
+    }
+
+    private void processJar(final File input, final File output, final boolean stripSignatures, final boolean remapEmbedded, final Map<String, String> remapData) throws IOException
+    {
+        Remapper remapper = new Remapper() {
+            @Override
+            public String mapFieldName(final String owner, final String name, final String descriptor) {
+                return remapData.getOrDefault(name, name);
+            }
+            @Override
+            public String mapInvokeDynamicMethodName(final String name, final String descriptor) {
+                return remapData.getOrDefault(name, name);
+            }
+            @Override
+            public String mapMethodName(final String owner, final String name, final String descriptor) {
+              return remapData.getOrDefault(name, name);
+            }
+        };
+
+        log("Processing ZIP file");
+        List<ZipEntryProcessor> processors = new ArrayList<>();
+        processors.add(new ZipEntryProcessor(ein -> ein.getName().endsWith(".class"), (ein, zin, zout) -> this.processClass(ein, zin, zout, remapper)));
+
+        if (stripSignatures) {
+            processors.add(new ZipEntryProcessor(this::holdsSignatures, (ein, zin, zout) -> log("Stripped signature entry data " + ein.getName())));
+            processors.add(new ZipEntryProcessor(ein -> ein.getName().endsWith("META-INF/MANIFEST.MF"), this::processManifest));
+        }
+
+        if (remapEmbedded) {
+            createProcessorForEmbeddedJars(input, processors, stripSignatures, remapEmbedded, remapData);
+        }
+
+        ZipWritingConsumer defaultProcessor = (ein, zin, zout) -> {
+            zout.putNextEntry(makeNewEntry(ein));
+            Utils.copy(zin, zout);
+        };
+
+        ByteArrayOutputStream memory = input.equals(output) ? new ByteArrayOutputStream() : null;
+        try (ZipOutputStream zout = new ZipOutputStream(memory == null ? Files.newOutputStream(output.toPath()) : memory);
+             ZipInputStream in = new ZipInputStream(Files.newInputStream(input.toPath()))) {
+
+            forEachZipEntry(in, (ein, zin) -> processors.stream()
+                    .filter(it -> it.validate(ein))
+                    .findFirst()
+                    .map(ZipEntryProcessor::getProcessor)
+                    .orElse(defaultProcessor)
+                    .process(ein, zin, zout));
+        }
+
+        if (memory != null)
+            Files.write(output.toPath(), memory.toByteArray());
+    }
+
+    private void createProcessorForEmbeddedJars(final File input, final List<ZipEntryProcessor> processors, final boolean stripSignatures, final boolean remapEmbedded, final Map<String, String> remapData)
+    {
+        try(final ZipFile zip = new ZipFile(input))
+        {
+            final ZipEntry metadataEntry = zip.getEntry(Constants.CONTAINED_JARS_METADATA_PATH);
+            if (metadataEntry == null || metadataEntry.isDirectory())
+                return;
+
+            final Optional<Metadata> metadata = MetadataIOHandler.fromStream(zip.getInputStream(metadataEntry));
+            if (!metadata.isPresent())
+                return;
+
+            final Set<ContainedJarMetadata> toDeobfuscate = metadata.get().jars().stream()
+                    .filter(ContainedJarMetadata::isObfuscated)
+                    .collect(Collectors.toSet());
+
+            processors.add(new ZipEntryProcessor(ein -> toDeobfuscate.stream().anyMatch(jar -> jar.path().equals(ein.getName())), (ein, zin, zout) -> {
+                final File tempInputFile = File.createTempFile("deobfuscate", ".jar");
+                final File tempOutputFile = File.createTempFile("deobfuscated", ".jar");
+                Files.write(tempInputFile.toPath(), Utils.toByteArray(zin));
+
+                processJar(tempInputFile, tempOutputFile, stripSignatures, remapEmbedded, remapData);
+
+                zout.putNextEntry(makeNewEntry(ein));
+                zout.write(Files.readAllBytes(tempOutputFile.toPath()));
+
+                tempInputFile.delete();
+                tempOutputFile.delete();
+            }));
+        }
+        catch (IOException e)
+        {
+            error("Failed to open input jar: " + input);
             e.printStackTrace();
         }
     }
