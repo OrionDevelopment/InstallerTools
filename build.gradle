@@ -10,7 +10,7 @@ plugins {
 
 group = 'net.minecraftforge'
 
-version = gradleutils.getTagOffsetVersion()
+version = "6.0.0"
 println('Version: ' + version)
 java.toolchain.languageVersion = JavaLanguageVersion.of(8)
 
